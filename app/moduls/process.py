@@ -15,69 +15,67 @@ import json
 def read_image_with_rasterio(image_path):
     with rasterio.open(image_path) as src:
         image = src.read()
-        image = np.moveaxis(image, 0, -1)  # Перемещаем каналы в конец для совместимости с OpenCV
+        image = np.moveaxis(image, 0, -1)
         if image.shape[2] == 1:
             image_rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
         elif image.shape[2] > 3:
-            image_rgb = image[:, :, :3]  # Используем только первые 3 канала (R, G, B)
+            image_rgb = image[:, :, :3]
         else:
             image_rgb = image
         
-        # Проверяем и конвертируем изображение в uint8
         if image_rgb.dtype != np.uint8:
             image_rgb = cv2.convertScaleAbs(image_rgb, alpha=(255.0/np.max(image_rgb)))
         return image_rgb, src
 
 def detect_and_match_features(scene_image, layout_image):
-    # Используем ORB для обнаружения и описания ключевых точек
-    orb = cv2.ORB_create()
-
-    # Обнаружение ключевых точек и вычисление дескрипторов
+    orb = cv2.ORB_create(nfeatures=2000)
     keypoints_scene, descriptors_scene = orb.detectAndCompute(scene_image, None)
     keypoints_layout, descriptors_layout = orb.detectAndCompute(layout_image, None)
-
-    # Сопоставление ключевых точек с помощью BFMatcher
+    
     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
     matches = bf.match(descriptors_scene, descriptors_layout)
-
-    # Сортируем совпадения по расстоянию (чем меньше, тем лучше)
+    
     matches = sorted(matches, key=lambda x: x.distance)
-
+    
     return keypoints_scene, keypoints_layout, matches
 
 def get_matched_keypoints(keypoints_scene, keypoints_layout, matches):
     points_scene = np.zeros((len(matches), 2), dtype=np.float32)
     points_layout = np.zeros((len(matches), 2), dtype=np.float32)
-
     for i, match in enumerate(matches):
         points_scene[i, :] = keypoints_scene[match.queryIdx].pt
         points_layout[i, :] = keypoints_layout[match.trainIdx].pt
-
     return points_scene, points_layout
 
-def calculate_transformed_scene_corners(scene_rgb, transform_matrix, layout_transform):
+def calculate_transformed_scene_corners(scene_rgb, transform_matrix, layout_transform, layout_res, scene_res):
     height, width, _ = scene_rgb.shape
 
-    def normalize(point):
-        return point[:2] / point[2]
+    def apply_transform(x, y, matrix):
+        point = np.array([x, y, 1.0])
+        transformed_point = np.dot(matrix, point)
+        return transformed_point[0] / transformed_point[2], transformed_point[1] / transformed_point[2]
 
-    # Вычисляем координаты углов сцены после преобразования
-    top_left_scene = normalize(np.dot(transform_matrix, np.array([0, 0, 1])))
-    top_right_scene = normalize(np.dot(transform_matrix, np.array([width, 0, 1])))
-    bottom_right_scene = normalize(np.dot(transform_matrix, np.array([width, height, 1])))
-    bottom_left_scene = normalize(np.dot(transform_matrix, np.array([0, height, 1])))
+    top_left_scene = apply_transform(0, 0, transform_matrix)
+    top_right_scene = apply_transform(width, 0, transform_matrix)
+    bottom_right_scene = apply_transform(width, height, transform_matrix)
+    bottom_left_scene = apply_transform(0, height, transform_matrix)
 
-    # Привязываем координаты сцены к координатной сетке подложки
-    top_left_layout = layout_transform * (top_left_scene[0], top_left_scene[1])
-    top_right_layout = layout_transform * (top_right_scene[0], top_right_scene[1])
-    bottom_right_layout = layout_transform * (bottom_right_scene[0], bottom_right_scene[1])
-    bottom_left_layout = layout_transform * (bottom_left_scene[0], bottom_left_scene[1])
+    def to_world_coords(x, y, transform, res_ratio):
+        new_x, new_y = rasterio.transform.xy(transform, y * res_ratio, x * res_ratio, offset='center')
+        return new_x, new_y
 
-    coords_text = []
-    coords_text.append(f"top_left: ({top_left_layout[0]:.3f}, {top_left_layout[1]:.3f})")
-    coords_text.append(f"top_right: ({top_right_layout[0]:.3f}, {top_right_layout[1]:.3f})")
-    coords_text.append(f"bottom_right: ({bottom_right_layout[0]:.3f}, {bottom_right_layout[1]:.3f})")
-    coords_text.append(f"bottom_left: ({bottom_left_layout[0]:.3f}, {bottom_left_layout[1]:.3f})")
+    res_ratio = layout_res / scene_res
+    top_left_layout = to_world_coords(top_left_scene[0], top_left_scene[1], layout_transform, res_ratio)
+    top_right_layout = to_world_coords(top_right_scene[0], top_right_scene[1], layout_transform, res_ratio)
+    bottom_right_layout = to_world_coords(bottom_right_scene[0], bottom_right_scene[1], layout_transform, res_ratio)
+    bottom_left_layout = to_world_coords(bottom_left_scene[0], bottom_left_scene[1], layout_transform, res_ratio)
+
+    coords_text = [
+        f"top_left: ({top_left_layout[0]:.3f}, {top_left_layout[1]:.3f})",
+        f"top_right: ({top_right_layout[0]:.3f}, {top_right_layout[1]:.3f})",
+        f"bottom_right: ({bottom_right_layout[0]:.3f}, {bottom_right_layout[1]:.3f})",
+        f"bottom_left: ({bottom_left_layout[0]:.3f}, {bottom_left_layout[1]:.3f})"
+    ]
 
     coords = {
         "type": "Polygon",
@@ -107,11 +105,9 @@ def save_geojson(coords, output_path):
         json.dump(geojson_data, f, indent=4)
         
 def save_geotiff(image, layout_corners, crs, output_path):
-    # Создаем трансформацию на основе углов изображения сцены
     top_left, top_right, bottom_right, bottom_left = layout_corners
     height, width, _ = image.shape
 
-    # Определяем новые границы изображения
     x_min = min(top_left[0], bottom_left[0])
     x_max = max(top_right[0], bottom_right[0])
     y_min = min(top_left[1], top_right[1])

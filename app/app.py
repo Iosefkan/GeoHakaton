@@ -47,7 +47,10 @@ def predict():
     filename = request.args.get('filename')
     if not layout_name or not filename:
         return make_response(jsonify(success = False), 400)
-    result = process_images('../layouts', app.config['UPLOAD_FOLDER'], layout_name, filename, './geotiff', './geotiff')
+    try:
+        result = process_images('./layouts', app.config['UPLOAD_FOLDER'], layout_name, filename, './geotiff', './geotiff')
+    except:
+        return make_response(jsonify(success = False), 500)
     return result
     
     

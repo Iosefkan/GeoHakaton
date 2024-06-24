@@ -5,7 +5,6 @@ services:
     container_name: flask_app
     volumes:
       - ./app:/app
-      - ./layouts:/app/layouts
     ports:
       - "8000:80"
     command: python app.py
